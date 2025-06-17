@@ -1,8 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router"
 import { type ComponentPropsWithoutRef, useState } from "react"
 import { VideoPreview } from "../components/video-preview"
-import { addClip, startPreview } from "../lib/commands"
-import { timeNs } from "../lib/time"
+import { addClip } from "../lib/commands"
+import { time } from "../lib/time"
 
 const Button = ({
   onClick,
@@ -20,23 +20,19 @@ const Button = ({
   )
 }
 
-const StartPreviewButton = () => {
-  return <Button onClick={() => startPreview()}>Start Preview</Button>
-}
-
 const AddClipForm = () => {
   const [filePath, setFilePath] = useState("")
   const [layerPriority, setLayerPriority] = useState(0)
   const [startNs, setStartNs] = useState(0)
-  const [endNs, setEndNs] = useState(0)
+  const [endNs, setEndNs] = useState(time.s(10).to("ns").value) // Default to 10 seconds
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault()
     addClip({
       filePath,
       layerPriority,
-      startNs: timeNs(startNs),
-      durationNs: timeNs(endNs),
+      startNs: time.ns(startNs),
+      durationNs: time.ns(endNs),
     })
       .then(() => {
         // Reset form fields after successful submission
@@ -102,8 +98,6 @@ const Index = () => {
   return (
     <div className="p-2 flex flex-col gap-6">
       <div className="flex flex-col gap-6">
-        <StartPreviewButton />
-        <hr />
         <AddClipForm />
       </div>
       <hr />

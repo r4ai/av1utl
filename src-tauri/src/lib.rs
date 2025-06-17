@@ -1,8 +1,9 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_editing_services::{self as ges, prelude::*};
 use gstreamer_video as gst_video;
 use std::{
+    path::Path,
     sync::{mpsc, Arc, Mutex},
     thread,
 };
@@ -18,6 +19,11 @@ pub enum EditorCommand {
     StartPreview {
         window: tauri::Window,
     },
+    StopPreview,
+    SeekTo {
+        position_ns: u64,
+    },
+    PlayPause,
 }
 
 pub struct AppState {
@@ -75,10 +81,47 @@ async fn start_preview(
     Ok(())
 }
 
+#[tauri::command]
+async fn stop_preview(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .editor_tx
+        .lock()
+        .unwrap()
+        .send(EditorCommand::StopPreview)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn seek_to(position_ns: u64, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .editor_tx
+        .lock()
+        .unwrap()
+        .send(EditorCommand::SeekTo { position_ns })
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn play_pause(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .editor_tx
+        .lock()
+        .unwrap()
+        .send(EditorCommand::PlayPause)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 fn handle_editor_command(
     command: EditorCommand,
     timeline: &ges::Timeline,
     preview_pipeline: &mut Option<ges::Pipeline>,
+    is_playing: &mut bool,
 ) -> anyhow::Result<()> {
     match command {
         EditorCommand::AddClip {
@@ -87,18 +130,19 @@ fn handle_editor_command(
             start_ns,
             duration_ns,
         } => {
+            let file_path = Path::new(&file_path);
+            if !file_path.exists() {
+                bail!("File does not exist: {}", file_path.display());
+            }
+
             // レイヤーを取得または作成
             let layer = timeline
                 .layer(layer_priority)
                 .context("Failed to get or create layer")?;
 
             // URIからアセットを作成
-            let file_path = if cfg!(target_os = "windows") {
-                file_path.replace('\\', "/") // Windowsではパスの区切りを変換
-            } else {
-                file_path
-            };
-            let uri = format!("file://{}", file_path);
+            let uri = gst::glib::filename_to_uri(&file_path, None)
+                .context("Failed to convert file path to URI")?;
             let asset =
                 ges::UriClipAsset::request_sync(&uri).context("Failed to create asset from URI")?;
 
@@ -116,36 +160,22 @@ fn handle_editor_command(
             Ok(())
         }
         EditorCommand::StartPreview { window } => {
-            // パイプラインの構築
-            let pipeline_str = r#"
-                videoconvert!
-                videoscale!
-                appsink name=preview_sink emit-signals=true sync=false
-            "#;
-            let preview_bin = gst::parse::launch(pipeline_str)?;
-
+            // GESパイプラインを作成
             let pipeline = ges::Pipeline::new();
-            pipeline.set_timeline(timeline).unwrap();
-            pipeline.add(&preview_bin).unwrap();
+            pipeline.set_timeline(timeline)?;
 
-            let timeline_video_src = pipeline
-                .children()
-                .into_iter()
-                .find(|e| {
-                    e.factory()
-                        .map_or(false, |f| f.name() == "ges-video-source")
-                })
-                .context("Failed to find video source")?;
-
-            timeline_video_src.link(&preview_bin).unwrap();
-
-            let appsink: gstreamer_app::AppSink = preview_bin
-                .dynamic_cast::<gst::Bin>()
-                .unwrap()
-                .by_name("preview_sink")
-                .unwrap()
-                .downcast()
-                .unwrap();
+            // プレビュー用のsinkを作成
+            let appsink = gstreamer_app::AppSink::builder()
+                .name("preview_sink")
+                .caps(
+                    &gst::Caps::builder("video/x-raw")
+                        .field("format", "RGBA")
+                        .field("width", 1280)
+                        .field("height", 720)
+                        .build(),
+                )
+                .build(); // プレビューsinkを設定
+            pipeline.set_video_sink(Some(&appsink));
 
             // new-sampleシグナルに対するコールバックを設定 [11, 46]
             appsink.set_callbacks(
@@ -175,10 +205,37 @@ fn handle_editor_command(
                     })
                     .build(),
             );
-
             pipeline.set_state(gst::State::Playing).unwrap();
             *preview_pipeline = Some(pipeline);
 
+            Ok(())
+        }
+        EditorCommand::StopPreview => {
+            if let Some(pipeline) = preview_pipeline.take() {
+                pipeline.set_state(gst::State::Null)?;
+            }
+            *is_playing = false;
+            Ok(())
+        }
+        EditorCommand::SeekTo { position_ns } => {
+            if let Some(pipeline) = preview_pipeline {
+                pipeline.seek_simple(
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                    gst::ClockTime::from_nseconds(position_ns),
+                )?;
+            }
+            Ok(())
+        }
+        EditorCommand::PlayPause => {
+            if let Some(pipeline) = preview_pipeline {
+                if *is_playing {
+                    pipeline.set_state(gst::State::Paused)?;
+                    *is_playing = false;
+                } else {
+                    pipeline.set_state(gst::State::Playing)?;
+                    *is_playing = true;
+                }
+            }
             Ok(())
         }
     }
@@ -196,23 +253,35 @@ pub fn run() {
             app.manage(AppState {
                 editor_tx: Arc::new(Mutex::new(tx)),
             });
-
             thread::spawn(move || {
                 let timeline = ges::Timeline::new_audio_video();
                 timeline.append_layer();
 
                 let mut preview_pipeline: Option<ges::Pipeline> = None;
+                let mut is_playing = false;
 
                 while let Ok(command) = rx.recv() {
-                    handle_editor_command(command, &timeline, &mut preview_pipeline)
-                        .unwrap_or_else(|e| eprintln!("Error handling command: {}", e));
+                    handle_editor_command(
+                        command,
+                        &timeline,
+                        &mut preview_pipeline,
+                        &mut is_playing,
+                    )
+                    .unwrap_or_else(|e| eprintln!("Error handling command: {}", e));
                 }
             });
 
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, add_clip, start_preview])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            add_clip,
+            start_preview,
+            stop_preview,
+            seek_to,
+            play_pause
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

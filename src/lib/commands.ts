@@ -1,12 +1,12 @@
 import { invoke } from "@tauri-apps/api/core"
 import { type EventCallback, listen } from "@tauri-apps/api/event"
-import type { TimeNs } from "./time"
+import type { Time } from "./time"
 
 export type AddClipOptions = {
   filePath: string
   layerPriority: number
-  startNs: TimeNs
-  durationNs: TimeNs
+  startNs: Time<"ns">
+  durationNs: Time<"ns">
 }
 
 export const addClip = ({
@@ -23,6 +23,13 @@ export const addClip = ({
   })
 
 export const startPreview = () => invoke<void>("start_preview")
+
+export const stopPreview = () => invoke<void>("stop_preview")
+
+export const seekTo = (positionNs: Time<"ns">) =>
+  invoke<void>("seek_to", { positionNs: positionNs.value })
+
+export const playPause = () => invoke<void>("play_pause")
 
 export type FramePayload = {
   width: number
